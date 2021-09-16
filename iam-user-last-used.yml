@@ -1,0 +1,124 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Creates an AWS Config rule and Lambda to check all users' last used compliance"
+Transform: 'AWS::Serverless-2016-10-31'
+Parameters:
+
+  MaxDaysForLastUsed:
+    Description: Checks the number of days allowed for a user to be inactive before being deleted
+    Type: Number
+    Default: 180
+    MaxValue: 365
+    
+  MinDaysForLastUsed:
+    Description: Checks the number of days allowed for a user to be inactive before being quarantined
+    Type: Number
+    Default: 90
+    MaxValue: 179
+
+  NameOfSolution:
+    Type: String
+    Default: iam-user-last-used
+    Description: The name of the solution - used for naming of created resources
+
+  UserPatternWhitelist:
+    Description: Pipe separated whitelist of users using simple string matching
+    Type: String
+    Default: ''
+    AllowedPattern: '[-a-zA-Z0-9+=,.@_/|*]+|^$'
+
+  LambdaLayerArn:
+    Type: String
+    Description: The ARN for the Lambda Layer you will use.
+  
+Resources:
+  LambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    DependsOn: CheckUserLastUsedLambda
+    Properties: 
+      FunctionName: !GetAtt CheckUserLastUsedLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: config.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${NameOfSolution}-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: !Sub '${NameOfSolution}'
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - config:PutEvaluations
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - iam:Get*
+            - iam:List*
+            - iam:DeleteUser
+            - iam:DeleteUserPermissionsBoundary
+            - iam:PutUserPermissionsBoundary
+            - iam:DeleteLoginProfile
+            - iam:UpdateAccessKey
+            - iam:DeleteAccessKey
+            - iam:DeactivateMFADevice
+            - iam:DeleteVirtualMFADevice
+            - iam:UntagMFADevice
+            - iam:DetachUserPolicy
+            - iam:DeleteUserPolicy
+            - iam:RemoveUserFromGroup
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource:
+            - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:*:log-group:/aws/lambda/${NameOfSolution}:log-stream:*'
+
+  CheckUserLastUsedLambda:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Description: "Checks IAM users' last used info for AWS Config"
+      FunctionName: !Sub '${NameOfSolution}'
+      Handler: lambda_function.evaluate_compliance
+      MemorySize: 256
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.7
+      Timeout: 300
+      CodeUri: .
+      Layers:
+      - !Ref LambdaLayerArn
+
+  LambdaLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties: 
+      LogGroupName: !Sub '/aws/lambda/${NameOfSolution}'
+      RetentionInDays: 30
+
+  ConfigCustomRule:
+    Type: 'AWS::Config::ConfigRule'
+    DependsOn:
+    - LambdaInvokePermission
+    - LambdaExecutionRole
+    Properties:
+      ConfigRuleName: !Sub '${NameOfSolution}'
+      Description: Checks the number of days that an IAM user has not been used to make a service request. If the number of days exceeds the specified threshold, it is marked as non-compliant.
+      InputParameters: !Sub '{"user_whitelist":"${UserPatternWhitelist}","min_days_for_last_used":"${MinDaysForLastUsed}","max_days_for_last_used":"${MaxDaysForLastUsed}"}'
+      Source: 
+        Owner: CUSTOM_LAMBDA
+        SourceDetails: 
+        - EventSource: aws.config
+          MaximumExecutionFrequency: TwentyFour_Hours
+          MessageType: ScheduledNotification
+        SourceIdentifier: !GetAtt CheckUserLastUsedLambda.Arn
